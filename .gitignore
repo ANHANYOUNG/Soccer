@@ -1,0 +1,254 @@
+# ============================================================
+# Soccer Pass Prediction Project - Global .gitignore
+# ============================================================
+
+# ============================================================
+# Data Files (Large datasets)
+# ============================================================
+data/
+*.csv
+*.xlsx
+*.xls
+*.png
+*.jpg
+*.jpeg
+!data_description.xlsx  # 설명 파일은 포함
+!type_name_table.png    # 테이블 이미지는 포함
+!sample_submission.csv  # 샘플 제출 파일은 포함
+
+# ============================================================
+# Model Checkpoints & Training Outputs
+# ============================================================
+# LGBM
+LGBM/models/
+LGBM/*.csv
+LGBM/submission_*.csv
+LGBM/LGBM_*_submit_*.csv
+
+# LSTM
+LSTM/LSTM_result/
+LSTM/*.csv
+LSTM/LSTM_*_submit_*.csv
+
+# Transformer
+Transformer/models/
+Transformer/fold_log/
+Transformer/submit/
+Transformer/*.csv
+Transformer/Transformer_submit_*.csv
+
+# tf_base
+tf_base/models/
+tf_base/fold_log/
+tf_base/submit/
+tf_base/*.csv
+
+# ============================================================
+# Python
+# ============================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+myenv/
+.venv/
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# ============================================================
+# Jupyter Notebook
+# ============================================================
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+*.ipynb_checkpoints
+
+# Jupyter Notebook outputs (선택적)
+# *.ipynb
+
+# ============================================================
+# IDEs & Editors
+# ============================================================
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+
+# ============================================================
+# Operating Systems
+# ============================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+.directory
+.Trash-*
+.nfs*
+
+# ============================================================
+# Logs & Temporary Files
+# ============================================================
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Training logs
+fold_*.log
+*.out
+*.err
+
+# ============================================================
+# Archives & Compressed Files
+# ============================================================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.gz
+*.bz2
+
+# ============================================================
+# Git & Version Control
+# ============================================================
+*.orig
+*.rej
+
+# ============================================================
+# Project Specific
+# ============================================================
+# Checkpoints
+checkpoint/
+ckpt/
+saved_models/
+
+# Experimental folders
+experiments/
+scratch/
+test/
+tmp/
+
+# Large output files
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.onnx
+*.pb
+
+# Except label encoders (needed for inference)
+!label_encoders.pkl
+!**/label_encoders.pkl
+
+# ============================================================
+# Documentation (선택적 - 필요시 주석 해제)
+# ============================================================
+# docs/_build/
+# site/
+
+# ============================================================
+# Misc
+# ============================================================
+.env
+.env.local
+.env.*.local
+*.secret
+secrets.yaml
