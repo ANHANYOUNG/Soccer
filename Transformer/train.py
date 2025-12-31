@@ -1,89 +1,83 @@
-"""
-Transformer-based Pass Prediction Model - Training Script
-Based on LSTM_2.ipynb architecture, converted to Transformer
-"""
-
 # file/path utilities
 import os
 import glob
 from pathlib import Path
 import pickle
-
 # for data manipulation/math
 import pandas as pd
 import numpy as np
 import random
-
+import math
 # encoding (type_name to number) / split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import GroupKFold
-
 # progress bar
 from tqdm import tqdm
-
 # deep learning framework
 import torch
 from torch import nn
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader
-import math
-
-# ============================================================
-# 0. Command-line Arguments (병렬 학습용)
-# ============================================================
+# arg setting
 import argparse
+
+
+
+# -----------------------------------
+# arg setting for 5 GPU
+# -----------------------------------
 parser = argparse.ArgumentParser()
+# parallel training args
+# ex) python3 train.py --fold 0
 parser.add_argument('--fold', type=int, default=None, help='Train specific fold only (0-4), None for all folds')
+
+# modes for single batch test
+# ex) python3 train.py --mode overfit --overfit_epochs 1000
 parser.add_argument('--mode', type=str, default='train', choices=['train', 'overfit'], 
                     help='train: full training, overfit: single batch overfitting test')
+
+# overfit: single batch test -> to check training converges
 parser.add_argument('--overfit_epochs', type=int, default=500, help='Epochs for overfit mode')
 args, _ = parser.parse_known_args()
 
-# ============================================================
-# 1. Hyperparameters
-# ============================================================
-
+# -----------------------------------
+# Hyperparameters
+# -----------------------------------
 SEED = 42
-SEEDS = [42, 123, 456]  # 3개 시드로 축소 (계산량 감소)
+SEEDS = [42, 123, 456] # for ensemble
 
 # cross-validation
 N_SPLITS = 5
-FOLD = args.fold if args.fold is not None else None  # CLI 인자 우선, 없으면 None (전체 fold)
+FOLD = args.fold if args.fold is not None else None # no args -> None (all folds), yes args -> specific fold
 
 # sequence length
-K = 50
-MIN_EVENTS = 2
+MIN_EVENTS = 2 # no need less than 2
+K_TRUNCATE = 50 # sequence truncation
 
 # training parameters
 EPOCHS = 150
 BATCH_SIZE = 256
 LR = 1e-3
+
+# regularization
 WEIGHT_DECAY = 1e-5
+DROPOUT = 0.2
 
 # model parameters
-D_MODEL = 256          # Transformer hidden dimension
-N_HEADS = 8            # Number of attention heads
-N_LAYERS = 4           # Number of transformer encoder layers
-DIM_FEEDFORWARD = 512  # Feed-forward network dimension
-DROPOUT = 0.2          # Dropout rate
-EMB_DIM = 16           # Embedding dimension for categorical features
+D_MODEL = 256          # Transformer hidden dimension: inner vector expression size, large -> more capacity, computation
+N_HEADS = 8            # Number of attention heads, D_MODEL must be divisible by N_HEADS
+N_LAYERS = 4           # Number of transformer encoder layers (self attention + MLP)
+DIM_FEEDFORWARD = 512  # Feed-forward network dimension: D_MODEL -> DIM_FEEDFORWARD -> D_MODEL add unlinearity
+EMB_DIM = 16           # Embedding dimension for categorical features(type_id, res_id)
 
 # model options
-USE_CLS_TOKEN = False  # CLS 토큰 미사용
-USE_GAUSSIAN_NLL = True  # Gaussian NLL
-PREDICT_DELTA = True  # Delta 예측 (상대 좌표)
-USE_LAST_TOKEN = True  # Last-token pooling (압도적 성능 향상)
+USE_GAUSSIAN_NLL = True  # Gaussian NLL loss
+PREDICT_DELTA = True     # predict end_x, end_y as delta from start_x, start_y
 
 # augmentation parameters
-USE_AUGMENT = False    # 증강 OFF
+USE_AUGMENT = False
 NOISE_STD = 0.5
-
-# sequence truncation (마지막 K개 이벤트만 사용)
-K_TRUNCATE = 50        # 최적값
-
-# data loader parameters
-NUM_WORKERS = 0
 
 # paths
 TRAIN_PATH = "../data/train.csv"
@@ -91,7 +85,7 @@ MODEL_SAVE_DIR = "./models"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-
+# for reproducibility
 def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -99,18 +93,15 @@ def seed_everything(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
 seed_everything(SEED)
 print("Using device:", DEVICE)
 
 
-# ============================================================
-# 2. Data Loading and Preprocessing
-# ============================================================
+# -----------------------------------
+# Data Loading and Preprocessing
+# -----------------------------------
 
 def load_and_preprocess_data(train_path):
-    """Load and preprocess training data"""
     df = pd.read_csv(train_path)
     
     # sort events inside each episode by time, then action_id
@@ -126,15 +117,15 @@ def load_and_preprocess_data(train_path):
     le_team = LabelEncoder()
     le_player = LabelEncoder()
     
+    # shift by +1 to reserve 0 for padding
     df["type_id"] = le_type.fit_transform(df["type_name"]) + 1
     df["res_id"] = le_res.fit_transform(df["result_name"]) + 1
     
     return df, le_type, le_res
 
 
-def build_episodes(df, le_type, le_res):
-    """Build episode sequences from dataframe"""
-    
+def build_episodes(df, le_type, le_res):    
+
     # stadium constants
     STADIUM_X, STADIUM_Y = 105.0, 68.0
     CENTER_Y = STADIUM_Y / 2.0
@@ -147,17 +138,19 @@ def build_episodes(df, le_type, le_res):
     P_BOX_Y_MIN = CENTER_Y - 20.16
     P_BOX_Y_MAX = CENTER_Y + 20.16
     
+    # model inputs/targets
     episodes = []
     targets = []
     episode_keys = []
     episode_game_ids = []
-    
-    for key, g in tqdm(df.groupby("game_episode"), desc="Building episodes"):
-        g = g.reset_index(drop=True)
+
+    # key = game_episode: {game_id}_{episode_id}
+    for key, g in tqdm(df.groupby("game_episode"), desc="Loading episodes"):
+        g = g.reset_index(drop=True) # index reset 0,1,2...
         if len(g) < 2:
             continue
         
-        # target data is the last Pass event's end point
+        # fix last event as Pass
         if g.iloc[-1]["type_name"] != "Pass":
             pass_idxs = g.index[g["type_name"] == "Pass"]
             if len(pass_idxs) == 0:
@@ -166,12 +159,12 @@ def build_episodes(df, le_type, le_res):
             if len(g) < 2:
                 continue
         
-        # target is the last event's end point
+        # target: last event's end point
         tx, ty = float(g.loc[len(g)-1, "end_x"]), float(g.loc[len(g)-1, "end_y"])
         if np.isnan(tx) or np.isnan(ty):
             continue
         
-        # compute dt inside episode
+        # dt
         t = g["time_seconds"].astype("float32").values
         dt = np.zeros_like(t, dtype="float32")
         dt[1:] = t[1:] - t[:-1]
@@ -183,7 +176,7 @@ def build_episodes(df, le_type, le_res):
         ex = g["end_x"].astype("float32").values
         ey = g["end_y"].astype("float32").values
         
-        # leak-safe masking for last event's end
+        # leak-safe masking
         ex_mask = ex.copy()
         ey_mask = ey.copy()
         ex_mask[-1] = 0.0
@@ -224,14 +217,23 @@ def build_episodes(df, le_type, le_res):
         type_id = g["type_id"].astype("int64").values
         res_id = g["res_id"].astype("int64").values
         
-        # continuous features (12개)
+        # continuous features
         cont = np.stack([
-            sx, sy, ex_mask, ey_mask, dt,
-            dist_to_goal, theta_view, in_own_half,
-            dist_p_box, prev_dx, prev_dy, prev_valid
+            sx,            # 1
+            sy,            # 2
+            ex_mask,       # 3
+            ey_mask,       # 4
+            dt,            # 5
+            dist_to_goal,  # 6
+            theta_view,    # 7
+            in_own_half,   # 8
+            dist_p_box,    # 9
+            prev_dx,       # 10
+            prev_dy,       # 11
+            prev_valid     # 12
         ], axis=1).astype("float32")
         
-        # K truncation: 마지막 K개 이벤트만 사용 (최근 컨텍스트에 집중)
+        # use last K events only (focus on recent context)
         if K_TRUNCATE is not None and len(cont) > K_TRUNCATE:
             cont = cont[-K_TRUNCATE:]
             type_id = type_id[-K_TRUNCATE:]
@@ -241,12 +243,12 @@ def build_episodes(df, le_type, le_res):
             "cont": cont,
             "type_id": type_id,
             "res_id": res_id,
-            "last_start_x": sx[-1],  # 마지막 이벤트의 시작점 (delta 복원용)
+            "last_start_x": sx[-1],
             "last_start_y": sy[-1],
-            "last_result_id": int(res_id[-1])  # 마지막 이벤트의 result (성공/실패)
+            "last_result_id": int(res_id[-1])
         })
         
-        # target: PREDICT_DELTA에 따라 절대좌표 또는 상대좌표
+        # target
         if PREDICT_DELTA:
             # (dx, dy) = (end - start) of last event
             dx = tx - sx[-1]
@@ -255,18 +257,18 @@ def build_episodes(df, le_type, le_res):
         else:
             targets.append(np.array([tx, ty], dtype="float32"))
         episode_keys.append(key)
-        # game_id를 원본 컬럼에서 직접 가져옴 (문자열 파싱 오류 방지)
+
         episode_game_ids.append(str(g.iloc[0]["game_id"]))
     
     return episodes, targets, episode_keys, episode_game_ids
 
 
-# ============================================================
-# 3. Dataset and DataLoader
-# ============================================================
+# ------------------------------------
+# Dataset and DataLoader
+# ------------------------------------
 
 class EpisodeDataset(Dataset):
-    def __init__(self, episodes, targets, keys, augment=False, noise_std=0.0):
+    def __init__(self, episodes, targets, keys, augment=False, noise_std=0.0): # default
         self.episodes = episodes
         self.targets = targets
         self.keys = keys
@@ -280,6 +282,7 @@ class EpisodeDataset(Dataset):
         ep = self.episodes[idx]
         cont = ep["cont"].copy()
         
+        # data augmentation: Gaussian noise on positions
         if self.augment and self.noise_std > 0:
             noise = np.random.randn(cont.shape[0], 4).astype("float32") * self.noise_std
             cont[:, 0:4] += noise
@@ -294,7 +297,7 @@ class EpisodeDataset(Dataset):
         y = torch.from_numpy(self.targets[idx])
         key = self.keys[idx]
         
-        # 마지막 이벤트 정보: start_x, start_y, result_id
+        # last event info: start_x, start_y, result_id
         last_start = torch.tensor([ep["last_start_x"], ep["last_start_y"]], dtype=torch.float32)
         last_result_id = torch.tensor(ep["last_result_id"], dtype=torch.long)
         
@@ -302,74 +305,88 @@ class EpisodeDataset(Dataset):
 
 
 def collate_fn(batch):
+    # batch: list of samples
     conts, type_ids, res_ids, ys, keys, last_starts, last_result_ids = zip(*batch)
+    
+    # original length before padding
     lengths = torch.tensor([c.shape[0] for c in conts], dtype=torch.long)
     
-    cont_pad = pad_sequence(conts, batch_first=True, padding_value=0.0)
-    type_pad = pad_sequence(type_ids, batch_first=True, padding_value=0)
-    res_pad = pad_sequence(res_ids, batch_first=True, padding_value=0)
-    y = torch.stack(ys, dim=0).float()
-    last_start = torch.stack(last_starts, dim=0).float()
-    last_result_id = torch.stack(last_result_ids, dim=0).long()
+    # pad length to max in batch (pad back with 0, (ex) 1,2,...,Tmax,0,0,...)
+    cont_pad = pad_sequence(conts, batch_first=True, padding_value=0.0)  # [B, Tmax, cont_dim]
+    type_pad = pad_sequence(type_ids, batch_first=True, padding_value=0) # [B, Tmax]
+    res_pad = pad_sequence(res_ids, batch_first=True, padding_value=0)   # [B, Tmax]
+
+    # stack targets and last event info
+    y = torch.stack(ys, dim=0).float()                            # [B, 2]
+    last_start = torch.stack(last_starts, dim=0).float()          # [B, 2]
+    last_result_id = torch.stack(last_result_ids, dim=0).long()   # [B]
     
     return cont_pad.float(), type_pad.long(), res_pad.long(), lengths, y, keys, last_start, last_result_id
 
 
-# ============================================================
-# 4. Transformer Model
-# ============================================================
-
+# ------------------------------------
+# Transformer Model
+# ------------------------------------
 class PositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding for transformer"""
-    def __init__(self, d_model, max_len=500, dropout=0.1):
+    # let transformer know about positions by adding sin/cos functions -> model can distinguish positions
+    def __init__(self, d_model, dropout, max_len=500):
         super().__init__()
+
+        # dropout declare (used in forward)
         self.dropout = nn.Dropout(p=dropout)
         
+        # pe: (0,1,2,...,max_len-1) stores position vectors
+        # pe[t,:] = position vector at position t
         pe = torch.zeros(max_len, d_model)
+
+        # position: ([0],[1],[2],...,[max_len-1]) (column vector), shape (max_len, 1) by unsqueeze
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+
+        # controls frequencies: diff dim -> diff wavelength, shape (d_model/2,)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         
+        # even idx: sin, odd idx: cos
+        # why sin/cos? -> unique pattern for each position
+        # position * div_term = position(row) x freq(col)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
+
+        # add batch dimension to match x
         pe = pe.unsqueeze(0)  # (1, max_len, d_model)
         
+        # store as buffer (not a parameter)
         self.register_buffer('pe', pe)
     
     def forward(self, x):
-        # x: (B, T, d_model)
-        x = x + self.pe[:, :x.size(1), :]
+        # x: (B, T, d_model) = (# of episodes, length after padding, token dimension)
+        x = x + self.pe[:, :x.size(1), :] # add positional encoding (adding unique pattern to let model know about positions)
         return self.dropout(x)
 
-
-class PassTransformer(nn.Module):
-    """Transformer-based model for pass destination prediction"""
-    
-    def __init__(self, cont_dim, n_type, n_res, emb_dim=16, d_model=128, 
-                 n_heads=8, n_layers=4, dim_feedforward=512, dropout=0.2,
-                 use_cls_token=True, use_gaussian_nll=True, use_last_token=False):
+class PassTransformer(nn.Module):    
+    # input: cont_dim + type_id embedding + result_id embedding
+    # output: (dx, dy) or (mu_x, mu_y, log_var_x, log_var_y)
+    def __init__(self, cont_dim, n_type, n_res, emb_dim, d_model, 
+                 n_heads, n_layers, dim_feedforward, dropout,
+                 use_gaussian_nll):
         super().__init__()
         
-        self.use_cls_token = use_cls_token
+        # for easy change in hyperparam
         self.use_gaussian_nll = use_gaussian_nll
-        self.use_last_token = use_last_token
-        
-        # Embeddings for categorical features (type, result only)
+
+        # embedding: turn number idx to vector
+        # embeddings for categorical features (type_id, result_id only), consider 0 as padding
         self.type_emb = nn.Embedding(n_type, emb_dim, padding_idx=0)
         self.res_emb = nn.Embedding(n_res, emb_dim, padding_idx=0)
-        
-        # Input projection (cont + type + res embeddings)
+
+        # input projection token: (cont + type embedding + res embedding) -> d_model
         in_dim = cont_dim + emb_dim + emb_dim
-        self.input_proj = nn.Linear(in_dim, d_model)
-        self.input_ln = nn.LayerNorm(d_model)
-        
-        # [CLS] token (learnable)
-        if use_cls_token:
-            self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.input_proj = nn.Linear(in_dim, d_model) # project to d_model dimension
+        self.input_ln = nn.LayerNorm(d_model) # layer norm
         
         # Positional encoding
-        self.pos_encoder = PositionalEncoding(d_model, dropout=dropout)
+        self.pos_encoder = PositionalEncoding(d_model=d_model, dropout=dropout, max_len=500)
         
-        # Transformer encoder
+        # one encoder layer = (self-attention + feed-forward) with dropout, layer norms
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -379,151 +396,134 @@ class PassTransformer(nn.Module):
             batch_first=True,
             norm_first=True  # Pre-LN for better training stability
         )
+
+        # Transformer encoder: stack of encoder layers
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=n_layers
         )
         
-        # Attention pooling (used when not using CLS token and not using last token)
-        if not use_cls_token and not use_last_token:
-            self.attn_pool = nn.Linear(d_model, 1)
-        
-        # Output layers
+        # normalize pooled output
         self.layer_norm = nn.LayerNorm(d_model)
         
-        # Output dimension: 2 for (dx, dy), or 4 for Gaussian (mu_x, mu_y, log_var_x, log_var_y)
+        # Output dimension: 2 for (dx, dy), or 4 for Gaussian Loss (mu_x, mu_y, log_var_x, log_var_y)
         out_dim = 4 if use_gaussian_nll else 2
-        
-        # Simple head (skip connection 제거)
+
+        # head(MLP(FC)), applied after pooling
         self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, d_model),         # linear projection (reducing dim slowly)
+            nn.LayerNorm(d_model),                     
+            nn.GELU(),                    
+            nn.Dropout(dropout),                    
+            nn.Linear(d_model, d_model // 2),    # reduce dimension
             nn.LayerNorm(d_model // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model // 2, out_dim)
         )
         
+        # for debug, print(d_model)
         self.d_model = d_model
     
     def forward(self, cont_pad, type_pad, res_pad, lengths):
         B, T, _ = cont_pad.shape
         device = cont_pad.device
         
-        # Embed categorical features
+        # embed(num idx to vector) categorical features
         te = self.type_emb(type_pad)  # (B, T, emb_dim)
         re = self.res_emb(res_pad)    # (B, T, emb_dim)
         
-        # Concatenate all features
-        x = torch.cat([cont_pad, te, re], dim=-1)  # (B, T, in_dim)
-        
-        # Project to d_model dimension
+        # concatenate all features
+        x = torch.cat([cont_pad, te, re], dim=-1)  # (B, T, cont_dim(12) + emb_dim(16) + emb_dim(16)) = (B, T, in_dim(44))
+
+        # project to in_dim to d_model dimension
         x = self.input_proj(x)  # (B, T, d_model)
         
-        # Apply LayerNorm (패딩 영향 없음, 샘플별 독립 정규화)
+        # apply LayerNorm
         x = self.input_ln(x)  # (B, T, d_model)
         
-        # Prepend [CLS] token if using
-        if self.use_cls_token:
-            cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, d_model)
-            x = torch.cat([cls_tokens, x], dim=1)  # (B, T+1, d_model)
-            T_new = T + 1
-            # Update lengths for CLS token
-            lengths_with_cls = lengths + 1
-        else:
-            T_new = T
-            lengths_with_cls = lengths
-        
-        # Add positional encoding
+        # add positional encoding
         x = self.pos_encoder(x)
         
-        # Create padding mask (True for padding positions)
-        idx = torch.arange(T_new, device=device).unsqueeze(0)  # (1, T_new)
-        padding_mask = idx >= lengths_with_cls.unsqueeze(1)  # (B, T_new)
+        # create padding mask (True for padding positions)
+        # ex) B=2, T=5, lengths=[3,5], idx=[0,1,2,3,4] -> padding_mask = [False,False,False,True,True],
+        idx = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
+        padding_mask = idx >= lengths.unsqueeze(1)  # (B, T)
         
-        # Transformer encoder
-        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)  # (B, T_new, d_model)
+        # Transformer encoder ignoring padding positions
+        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)  # (B, T, d_model)
         
-        # Pooling
-        if self.use_cls_token:
-            # Use [CLS] token output (first position)
-            pooled = x[:, 0, :]  # (B, d_model)
-        elif self.use_last_token:
-            # Last-token pooling: 마지막 유효 토큰만 사용
-            # lengths는 유효 토큰 수, 인덱스는 lengths-1
-            last_indices = (lengths - 1).long()  # (B,)
-            batch_idx = torch.arange(B, device=device)  # (B,)
-            pooled = x[batch_idx, last_indices, :]  # (B, d_model)
-        else:
-            # Attention pooling (exclude CLS token position)
-            attn_scores = self.attn_pool(x).squeeze(-1)  # (B, T)
-            attn_scores = attn_scores.masked_fill(padding_mask, float('-inf'))
-            attn_weights = torch.softmax(attn_scores, dim=1)  # (B, T)
-            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-            pooled = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # (B, d_model)
+        # last token pooling, last = length - 1
+        last_indices = (lengths - 1).long()  # (B,)
+        batch_idx = torch.arange(B, device=device)  # (B,), batch index to pick one token per sample
+        pooled = x[batch_idx, last_indices, :]  # (B, T, d_model) -> (B, d_model)
         
         # Layer norm
         pooled = self.layer_norm(pooled)
-        
-        # Output head
+
+        # Output head(MLP)
         out = self.head(pooled)  # (B, 2 or 4)
         
         return out
 
 
-# ============================================================
-# 5. Loss Functions
-# ============================================================
+# ------------------------------------
+# Loss Functions
+# ------------------------------------
 
 class GaussianNLLLoss2D(nn.Module):
-    """2D Gaussian Negative Log-Likelihood Loss"""
+    # not predicting (x, y) directly, but predicting mean and variance of Gaussian for (x, y)
+    # input: from model -> (mu_x, mu_y, log_var_x, log_var_y) -> (target): (x, y)
+    # mu = mean
+    # log_var: for positive value
     def __init__(self, min_var=1e-4):
         super().__init__()
+
+        # ============ setup for loss calculation ============
+        # to avoid zero variance (denominator issue)
         self.min_var = min_var
     
     def forward(self, pred, target):
         # pred: (B, 4) -> (mu_x, mu_y, log_var_x, log_var_y)
         # target: (B, 2) -> (x, y)
         
-        mu_x = pred[:, 0]
-        mu_y = pred[:, 1]
-        log_var_x = pred[:, 2]
-        log_var_y = pred[:, 3]
+        # as model trains to minimize NLL, it will learn to predict mean close to target and small variance
+        mu_x = pred[:, 0]         # predicted mean dx
+        mu_y = pred[:, 1]         # predicted mean dy
+        log_var_x = pred[:, 2]    # predicted log variance dx
+        log_var_y = pred[:, 3]    # predicted log variance dy
         
         # Clamp log_var for numerical stability
         log_var_x = torch.clamp(log_var_x, min=-10, max=10)
         log_var_y = torch.clamp(log_var_y, min=-10, max=10)
         
+        # log_var -> var (ensure positive variance)
         var_x = torch.exp(log_var_x) + self.min_var
         var_y = torch.exp(log_var_y) + self.min_var
         
         target_x = target[:, 0]
         target_y = target[:, 1]
-        
+        # ======================================================
+
+        # loss calculation
         # NLL = 0.5 * (log(var) + (x - mu)^2 / var)
         nll_x = 0.5 * (log_var_x + (target_x - mu_x) ** 2 / var_x)
         nll_y = 0.5 * (log_var_y + (target_y - mu_y) ** 2 / var_y)
         
         return (nll_x + nll_y).mean()
 
-# ============================================================
-# 6. Training Functions
-# ============================================================
+# ------------------------------------
+# Training Functions
+# ------------------------------------
 
 def euclidean_sum_and_count(pred, true, last_start=None, predict_delta=False, use_gaussian=False):
-    """
-    Calculate Euclidean distance.
-    If predict_delta=True, convert delta to absolute coordinates first.
-    If use_gaussian=True, pred contains (mu_x, mu_y, log_var_x, log_var_y)
-    """
     if use_gaussian:
-        pred_xy = pred[:, :2]  # mu_x, mu_y only
+        pred_xy = pred[:, :2]  # mu_x, mu_y only to cal euclidean distance, var not used
     else:
         pred_xy = pred
     
+    # end = start + delta
+    # pred_abs 절댓값이 아니라 절대적인 위치라는 뜻
     if predict_delta and last_start is not None:
         # Convert delta to absolute: end = start + delta
         pred_abs = pred_xy + last_start
@@ -531,31 +531,38 @@ def euclidean_sum_and_count(pred, true, last_start=None, predict_delta=False, us
     else:
         pred_abs = pred_xy
         true_abs = true
-    
-    # 클리핑: 경기장 범위 내로 제한 (0~105, 0~68)
+
+    # clipping, stadium size (0~105, 0~68)
     pred_clipped = pred_abs.clone()
     pred_clipped[:, 0] = torch.clamp(pred_clipped[:, 0], 0.0, 105.0)
     pred_clipped[:, 1] = torch.clamp(pred_clipped[:, 1], 0.0, 68.0)
     
-    # 클리핑 전후 차이 계산 (튀는 예측 진단용)
+    # clipping difference for debug
     clip_diff = (pred_abs - pred_clipped).abs().sum().item()
     
+    # cal euclidean distance per sample
     d = torch.sqrt(((pred_clipped - true_abs) ** 2).sum(dim=1))
+
+    # sum and count used for average cal
+    # (total distance, number of samples, total clipping difference)
     return d.sum().item(), d.numel(), clip_diff
 
-
+# declare one epoch
 def train_one_epoch(model, train_loader, optimizer, criterion, device, 
                     predict_delta=False, use_gaussian=False):
     model.train()
-    
+
+    # used for epoch level averages
     tr_loss_sum = 0.0
     tr_loss_cnt = 0
     tr_euc_sum = 0.0
     tr_euc_cnt = 0
     tr_clip_diff = 0.0
     
+    # progress bar wrappin train loader
     pbar = tqdm(train_loader, desc="Training", leave=False)
     
+    # in pbar = in train loader
     for cont_pad, type_pad, res_pad, lengths, y, keys, last_start, last_result_id in pbar:
         cont_pad = cont_pad.to(device)
         type_pad = type_pad.to(device)
@@ -570,13 +577,16 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device,
         
         loss = criterion(pred, y)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # gradient clipping
         optimizer.step()
         
+        # for epoch level averages
         bsz = y.size(0)
         tr_loss_sum += loss.item() * bsz
         tr_loss_cnt += bsz
         
+        # no backprop
+        # for train evaluation
         e_sum, e_cnt, clip_d = euclidean_sum_and_count(
             pred.detach(), y, last_start, predict_delta, use_gaussian
         )
@@ -621,21 +631,17 @@ def validate(model, valid_loader, device, predict_delta=False, use_gaussian=Fals
     avg_dist = val_euc_sum / max(val_euc_cnt, 1)
     avg_clip = val_clip_diff / max(val_euc_cnt, 1)
     
-    if avg_clip > 0.1:
-        print(f"[WARNING] 튀는 예측 발견! 평균 클리핑 차이: {avg_clip:.2f}")
+    # if avg_clip > 0.1:
+    #     print(f"[WARNING] 튀는 예측 발견! 평균 클리핑 차이: {avg_clip:.2f}")
     
     return avg_dist
 
-
+# debug: overfit single batch
+# to check if model can learn by checking training loss goes down
 def overfit_single_batch(model, sample_batch, optimizer, criterion, device, 
                         epochs=500, predict_delta=False, use_gaussian=False):
-    """
-    Single batch overfitting test
-    - 모델이 학습 가능한지 확인
-    - Loss가 0에 가까워져야 정상
-    """
     print("\n" + "=" * 60)
-    print("SINGLE BATCH OVERFITTING TEST")
+    print("SINGLE BATCH TEST")
     print("=" * 60)
     print(f"  Epochs: {epochs}")
     print(f"  Batch size: {sample_batch[0].shape[0]}")
@@ -701,22 +707,19 @@ def overfit_single_batch(model, sample_batch, optimizer, criterion, device,
         print("\n  ⚠️ ERROR PLATEAUS! Try:")
         print("     - Higher learning rate")
         print("     - More epochs")
-    elif last_loss < 0.01:
-        print("\n  ✓ Successfully overfitting! Model can learn.")
+    elif last_loss < 0.5:
+        print("\n  Successfully overfitting! Model can learn.")
     else:
-        print("\n  △ Partial overfit. May need more epochs.")
+        print("\n  Partial overfit. May need more epochs.")
     
     return losses, dists
 
 
-# ============================================================
-# 7. Main Training Loop
-# ============================================================
-
+# ------------------------------------
+# Main Training Loop
+# ------------------------------------
 def train_single_seed(seed, episodes, targets, episode_keys, episode_game_ids, 
                       le_type, le_res, seed_idx=0, total_seeds=1, fold=None, mode='train'):
-    """Train a model with a specific seed and fold"""
-    
     print(f"\n{'='*60}")
     if fold is not None:
         print(f"Training seed {seed} ({seed_idx+1}/{total_seeds}) - Fold {fold} - Mode: {mode.upper()}")
@@ -735,13 +738,13 @@ def train_single_seed(seed, episodes, targets, episode_keys, episode_game_ids,
     os.makedirs(seed_save_dir, exist_ok=True)
     
     # Split train/valid
-    episode_game_ids_arr = np.array(episode_game_ids, dtype=str)  # 문자열로 유지
+    episode_game_ids_arr = np.array(episode_game_ids, dtype=str)
     unique_games = np.unique(episode_game_ids_arr)
     print(f"[GroupKFold] 총 {len(unique_games)}개 경기(game_id), {len(episodes)}개 에피소드")
     
     gkf = GroupKFold(n_splits=N_SPLITS)
-    
-    # fold가 지정된 경우 해당 fold만, None이면 첫 번째 fold (0)
+
+    # fold selection
     target_fold = fold if fold is not None else 0
     
     tr_idx, va_idx = None, None
@@ -754,14 +757,14 @@ def train_single_seed(seed, episodes, targets, episode_keys, episode_game_ids,
     
     assert tr_idx is not None and va_idx is not None
     
-    # 그룹 분포 확인
+    # overlap check
     train_games = set(episode_game_ids_arr[tr_idx])
     valid_games = set(episode_game_ids_arr[va_idx])
     overlap = train_games & valid_games
     if len(overlap) > 0:
-        print(f"[WARNING] Train/Valid game_id 겹침 발생! {len(overlap)}개")
+        print(f"[WARNING] Train/Valid game_id overlap! {len(overlap)}개")
     else:
-        print(f"[OK] Train {len(train_games)}개 경기, Valid {len(valid_games)}개 경기 (겹침 없음)")
+        print(f"[OK] Train {len(train_games)}개 경기, Valid {len(valid_games)}개 경기 (no overlap)")
     
     train_eps = [episodes[i] for i in tr_idx]
     train_tg = [targets[i] for i in tr_idx]
@@ -774,7 +777,7 @@ def train_single_seed(seed, episodes, targets, episode_keys, episode_game_ids,
     print(f"Train episodes: {len(train_eps)} | Valid episodes: {len(valid_eps)}")
     
     # Create datasets and dataloaders
-    # USE_AUGMENT 플래그로 증강 제어
+    # data augmentation if USE_AUGMENT is True
     train_ds = EpisodeDataset(train_eps, train_tg, train_keys, augment=USE_AUGMENT, noise_std=NOISE_STD)
     valid_ds = EpisodeDataset(valid_eps, valid_tg, valid_keys, augment=False)
     
@@ -782,6 +785,7 @@ def train_single_seed(seed, episodes, targets, episode_keys, episode_game_ids,
     valid_loader = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
     
     # Create model
+    # shift to avoid padding idx 0
     n_type = len(le_type.classes_) + 1
     n_res = len(le_res.classes_) + 1
     cont_dim = episodes[0]["cont"].shape[1]
@@ -796,19 +800,25 @@ def train_single_seed(seed, episodes, targets, episode_keys, episode_game_ids,
         n_layers=N_LAYERS,
         dim_feedforward=DIM_FEEDFORWARD,
         dropout=DROPOUT,
-        use_cls_token=USE_CLS_TOKEN,
-        use_gaussian_nll=USE_GAUSSIAN_NLL,
-        use_last_token=USE_LAST_TOKEN
+        use_gaussian_nll=USE_GAUSSIAN_NLL
     ).to(DEVICE)
     
     # Print model info (only first seed)
     if seed_idx == 0:
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
-        print(f"n_type: {n_type}, n_res: {n_res}, cont_dim: {cont_dim}")
-        print(f"USE_CLS_TOKEN: {USE_CLS_TOKEN}, USE_GAUSSIAN_NLL: {USE_GAUSSIAN_NLL}, PREDICT_DELTA: {PREDICT_DELTA}, USE_LAST_TOKEN: {USE_LAST_TOKEN}")
+        print(f"\n[Model Architecture]")
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Trainable parameters: {trainable_params:,}")
+        print(f"  n_type: {n_type}, n_res: {n_res}, cont_dim: {cont_dim}")
+        print(f"\n[Hyperparameters]")
+        print(f"  Training: EPOCHS={EPOCHS}, BATCH_SIZE={BATCH_SIZE}, LR={LR}")
+        print(f"  Regularization: WEIGHT_DECAY={WEIGHT_DECAY}, DROPOUT={DROPOUT}")
+        print(f"  Model: D_MODEL={D_MODEL}, N_HEADS={N_HEADS}, N_LAYERS={N_LAYERS}")
+        print(f"  Model: DIM_FEEDFORWARD={DIM_FEEDFORWARD}, EMB_DIM={EMB_DIM}")
+        print(f"  Options: USE_GAUSSIAN_NLL={USE_GAUSSIAN_NLL}, PREDICT_DELTA={PREDICT_DELTA}")
+        print(f"  Sequence: K_TRUNCATE={K_TRUNCATE}, MIN_EVENTS={MIN_EVENTS}")
+        print(f"  Augmentation: USE_AUGMENT={USE_AUGMENT}, NOISE_STD={NOISE_STD}")
     
     # Save model config
     config = {
@@ -821,10 +831,8 @@ def train_single_seed(seed, episodes, targets, episode_keys, episode_game_ids,
         "n_layers": N_LAYERS,
         "dim_feedforward": DIM_FEEDFORWARD,
         "dropout": DROPOUT,
-        "use_cls_token": USE_CLS_TOKEN,
         "use_gaussian_nll": USE_GAUSSIAN_NLL,
-        "predict_delta": PREDICT_DELTA,
-        "use_last_token": USE_LAST_TOKEN
+        "predict_delta": PREDICT_DELTA
     }
     with open(os.path.join(seed_save_dir, "model_config.pkl"), "wb") as f:
         pickle.dump(config, f)
@@ -835,15 +843,16 @@ def train_single_seed(seed, episodes, targets, episode_keys, episode_game_ids,
     else:
         criterion = nn.SmoothL1Loss()
     
+    # TODO optim 적합한지 공부
     # Optimizer, scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6
     )
     
-    # ============================================================
+    # ------------------------------------
     # MODE: overfit - Single batch overfitting test
-    # ============================================================
+    # ------------------------------------
     if mode == 'overfit':
         print("\n[Overfit Mode] Testing single batch overfitting...")
         # Get one batch
@@ -863,13 +872,14 @@ def train_single_seed(seed, episodes, targets, episode_keys, episode_game_ids,
         # Return dummy values for consistency
         return dists[-1], seed_save_dir
     
-    # ============================================================
+    # ------------------------------------
     # MODE: train - Full training
-    # ============================================================
+    # ------------------------------------
     # Training loop
     best_val = float('inf')
     best_state = None
     
+    # epoch loop
     for epoch in range(1, EPOCHS + 1):
         tr_loss, tr_euc = train_one_epoch(
             model, train_loader, optimizer, criterion, DEVICE,
@@ -939,7 +949,7 @@ def main():
     results = []
     
     if args.mode == 'overfit':
-        # Overfit mode: 첫 번째 시드, 첫 번째 fold만 테스트
+        # Overfit mode
         seed = SEEDS[0]
         fold = FOLD if FOLD is not None else 0
         best_val, seed_save_dir = train_single_seed(
@@ -953,7 +963,7 @@ def main():
             "path": seed_save_dir
         })
     elif FOLD is None:
-        # 5-fold 전체 학습
+        # 5-fold
         for seed_idx, seed in enumerate(SEEDS):
             for fold in range(N_SPLITS):
                 best_val, seed_save_dir = train_single_seed(
@@ -967,7 +977,7 @@ def main():
                     "path": seed_save_dir
                 })
     else:
-        # 특정 fold만 학습
+        # particular fold
         for seed_idx, seed in enumerate(SEEDS):
             best_val, seed_save_dir = train_single_seed(
                 seed, episodes, targets, episode_keys, episode_game_ids,
@@ -1002,11 +1012,11 @@ def main():
                 for r in fold_results:
                     print(f"    - Seed {r['seed']}: {r['best_val']:.4f}")
         
-        # 전체 평균
+        # overall average
         overall_avg = sum(r['best_val'] for r in results) / len(results)
         print(f"\n  Overall average: {overall_avg:.4f} ({len(results)} models)")
     else:
-        # 특정 fold만
+        # particular fold
         for r in results:
             print(f"  Seed {r['seed']}: valid_dist = {r['best_val']:.4f}")
         avg_val = sum(r['best_val'] for r in results) / len(results)
