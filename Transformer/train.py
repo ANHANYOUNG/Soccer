@@ -45,7 +45,7 @@ args, _ = parser.parse_known_args()
 # Hyperparameters
 # -----------------------------------
 SEED = 42
-SEEDS = [42, 123, 456] # for ensemble
+SEEDS = [42, 123, 456, 789, 1024] # for ensemble
 
 # cross-validation
 N_SPLITS = 5
@@ -65,7 +65,7 @@ WEIGHT_DECAY = 1e-5
 DROPOUT = 0.2
 
 # model parameters
-D_MODEL = 256          # Transformer hidden dimension: inner vector expression size, large -> more capacity, computation
+D_MODEL = 128          # Transformer hidden dimension: inner vector expression size, large -> more capacity, computation
 N_HEADS = 8            # Number of attention heads, D_MODEL must be divisible by N_HEADS
 N_LAYERS = 4           # Number of transformer encoder layers (self attention + MLP)
 DIM_FEEDFORWARD = 512  # Feed-forward network dimension: D_MODEL -> DIM_FEEDFORWARD -> D_MODEL add unlinearity

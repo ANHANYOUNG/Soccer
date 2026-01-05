@@ -1,9 +1,3 @@
-"""
-Transformer-based Pass Prediction Model - Inference Script
-Based on LSTM_2.ipynb architecture, converted to Transformer
-Supports multi-seed ensemble
-"""
-
 import os
 import pickle
 import glob
@@ -21,55 +15,71 @@ from torch.nn.utils.rnn import pad_sequence
 import math
 
 
-# ============================================================
-# 1. Model Definition (same as train.py)
-# ============================================================
+# -----------------------------------
+# Model Definition (same as train)
+# -----------------------------------
 
 class PositionalEncoding(nn.Module):
-    """Sinusoidal positional encoding for transformer"""
-    def __init__(self, d_model, max_len=500, dropout=0.1):
+    # let transformer know about positions by adding sin/cos functions -> model can distinguish positions
+    def __init__(self, d_model, dropout, max_len=500):
         super().__init__()
+
+        # dropout declare (used in forward)
         self.dropout = nn.Dropout(p=dropout)
         
+        # pe: (0,1,2,...,max_len-1) stores position vectors
+        # pe[t,:] = position vector at position t
         pe = torch.zeros(max_len, d_model)
+
+        # position: ([0],[1],[2],...,[max_len-1]) (column vector), shape (max_len, 1) by unsqueeze
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+
+        # controls frequencies: diff dim -> diff wavelength, shape (d_model/2,)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         
+        # even idx: sin, odd idx: cos
+        # why sin/cos? -> unique pattern for each position
+        # position * div_term = position(row) x freq(col)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
+
+        # add batch dimension to match x
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
         
+        # store as buffer (not a parameter)
         self.register_buffer('pe', pe)
     
     def forward(self, x):
-        x = x + self.pe[:, :x.size(1), :]
+        # x: (B, T, d_model) = (# of episodes, length after padding, token dimension)
+        x = x + self.pe[:, :x.size(1), :] # add positional encoding (adding unique pattern to let model know about positions)
         return self.dropout(x)
 
 
-class PassTransformer(nn.Module):
-    """Transformer-based model for pass destination prediction"""
-    
-    def __init__(self, cont_dim, n_type, n_res, emb_dim=16, d_model=128, 
-                 n_heads=8, n_layers=4, dim_feedforward=512, dropout=0.2,
-                 use_cls_token=True, use_gaussian_nll=True, use_last_token=False):
+class PassTransformer(nn.Module):    
+    # input: cont_dim + type_id embedding + result_id embedding
+    # output: (dx, dy) or (mu_x, mu_y, log_var_x, log_var_y)
+    def __init__(self, cont_dim, n_type, n_res, emb_dim, d_model, 
+                 n_heads, n_layers, dim_feedforward, dropout,
+                 use_gaussian_nll):
         super().__init__()
         
-        self.use_cls_token = use_cls_token
+        # for easy change in hyperparam
         self.use_gaussian_nll = use_gaussian_nll
-        self.use_last_token = use_last_token  # Last-token pooling 옵션
-        
+
+        # embedding: turn number idx to vector
+        # embeddings for categorical features (type_id, result_id only), consider 0 as padding
         self.type_emb = nn.Embedding(n_type, emb_dim, padding_idx=0)
         self.res_emb = nn.Embedding(n_res, emb_dim, padding_idx=0)
-        
+
+        # input projection token: (cont + type embedding + res embedding) -> d_model
         in_dim = cont_dim + emb_dim + emb_dim
-        self.input_proj = nn.Linear(in_dim, d_model)
-        self.input_ln = nn.LayerNorm(d_model)  # LayerNorm: 패딩 영향 없음
+        self.input_proj = nn.Linear(in_dim, d_model) # project to d_model dimension
+        self.input_ln = nn.LayerNorm(d_model) # layer norm
         
-        if use_cls_token:
-            self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model=d_model, dropout=dropout, max_len=500)
         
-        self.pos_encoder = PositionalEncoding(d_model, dropout=dropout)
-        
+        # one encoder layer = (self-attention + feed-forward) with dropout, layer norms
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -77,90 +87,81 @@ class PassTransformer(nn.Module):
             dropout=dropout,
             activation='gelu',
             batch_first=True,
-            norm_first=True
-        )
+            norm_first=True        )
+
+        # Transformer encoder: stack of encoder layers
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=n_layers
         )
         
-        # Attention pooling (used when not using CLS token and not using last token)
-        if not use_cls_token and not use_last_token:
-            self.attn_pool = nn.Linear(d_model, 1)
-        
+        # normalize pooled output
         self.layer_norm = nn.LayerNorm(d_model)
         
+        # Output dimension: 2 for (dx, dy), or 4 for Gaussian Loss (mu_x, mu_y, log_var_x, log_var_y)
         out_dim = 4 if use_gaussian_nll else 2
-        
+
+        # head(MLP(FC)), applied after pooling
         self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model // 2),
-            nn.LayerNorm(d_model // 2),
+            nn.Linear(d_model, d_model),            nn.LayerNorm(d_model),                     
+            nn.GELU(),                    
+            nn.Dropout(dropout),                    
+            nn.Linear(d_model, d_model // 2),            nn.LayerNorm(d_model // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model // 2, out_dim)
         )
         
+        # for debug, print(d_model)
         self.d_model = d_model
     
     def forward(self, cont_pad, type_pad, res_pad, lengths):
         B, T, _ = cont_pad.shape
         device = cont_pad.device
         
-        te = self.type_emb(type_pad)
-        re = self.res_emb(res_pad)
+        # embed(num idx to vector) categorical features
+        te = self.type_emb(type_pad)  # (B, T, emb_dim)
+        re = self.res_emb(res_pad)    # (B, T, emb_dim)
         
-        x = torch.cat([cont_pad, te, re], dim=-1)
-        x = self.input_proj(x)
+        # concatenate all features
+        x = torch.cat([cont_pad, te, re], dim=-1)  # (B, T, cont_dim(12) + emb_dim(16) + emb_dim(16)) = (B, T, in_dim(44))
+
+        # project to in_dim to d_model dimension
+        x = self.input_proj(x)  # (B, T, d_model)
         
-        # Apply LayerNorm (패딩 영향 없음)
-        x = self.input_ln(x)
+        # apply LayerNorm
+        x = self.input_ln(x)  # (B, T, d_model)
         
-        if self.use_cls_token:
-            cls_tokens = self.cls_token.expand(B, -1, -1)
-            x = torch.cat([cls_tokens, x], dim=1)
-            T_new = T + 1
-            lengths_with_cls = lengths + 1
-        else:
-            T_new = T
-            lengths_with_cls = lengths
-        
+        # add positional encoding
         x = self.pos_encoder(x)
         
-        idx = torch.arange(T_new, device=device).unsqueeze(0)
-        padding_mask = idx >= lengths_with_cls.unsqueeze(1)
+        # create padding mask (True for padding positions)
+        # ex) B=2, T=5, lengths=[3,5], idx=[0,1,2,3,4] -> padding_mask = [False,False,False,True,True],
+        idx = torch.arange(T, device=device).unsqueeze(0)  # (1, T)
+        padding_mask = idx >= lengths.unsqueeze(1)  # (B, T)
         
-        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
+        # Transformer encoder ignoring padding positions
+        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)  # (B, T, d_model)
         
-        # Pooling
-        if self.use_cls_token:
-            pooled = x[:, 0, :]
-        elif self.use_last_token:
-            # Last-token pooling: 마지막 유효 토큰만 사용
-            last_indices = (lengths - 1).long()
-            batch_idx = torch.arange(B, device=device)
-            pooled = x[batch_idx, last_indices, :]
-        else:
-            attn_scores = self.attn_pool(x).squeeze(-1)
-            attn_scores = attn_scores.masked_fill(padding_mask, float('-inf'))
-            attn_weights = torch.softmax(attn_scores, dim=1)
-            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-            pooled = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)
+        # last token pooling, last = length - 1
+        last_indices = (lengths - 1).long()  # (B,)
+        batch_idx = torch.arange(B, device=device)  # (B,), batch index to pick one token per sample
+        pooled = x[batch_idx, last_indices, :]  # (B, T, d_model) -> (B, d_model)
         
+        # Layer norm
         pooled = self.layer_norm(pooled)
-        out = self.head(pooled)
+
+        # Output head(MLP)
+        out = self.head(pooled)  # (B, 2 or 4)
         
         return out
 
 
-# ============================================================
-# 2. Feature Building
-# ============================================================
+# -----------------------------------
+# Feature Building
+# -----------------------------------
 
-# Stadium constants
+# stadium constants
 STADIUM_X, STADIUM_Y = 105.0, 68.0
 CENTER_Y = STADIUM_Y / 2.0
 HALF_X = STADIUM_X / 2.0
@@ -177,8 +178,10 @@ def build_episode_from_df(g, le_type, le_res):
     """Build features for a single episode
     Returns: cont, type_id, res_id, last_start_x, last_start_y
     """
+    # sort events inside each episode by time, then action_id
     g = g.sort_values(["time_seconds", "action_id"]).reset_index(drop=True)
     
+    # fill missing category text
     g["type_name"] = g["type_name"].fillna("__NA_TYPE__")
     g["result_name"] = g["result_name"].fillna("__NA_RES__")
     
@@ -186,6 +189,7 @@ def build_episode_from_df(g, le_type, le_res):
     g.loc[~g["type_name"].isin(le_type.classes_), "type_name"] = "__NA_TYPE__"
     g.loc[~g["result_name"].isin(le_res.classes_), "result_name"] = "__NA_RES__"
     
+    # change category text to idx(number), shift by +1 to reserve 0 for padding
     type_id = le_type.transform(g["type_name"]).astype("int64") + 1
     res_id = le_res.transform(g["result_name"]).astype("int64") + 1
     
@@ -195,7 +199,7 @@ def build_episode_from_df(g, le_type, le_res):
     dt[1:] = t[1:] - t[:-1]
     dt[dt < 0] = 0.0
     
-    # coordinates
+    # extract start/end positions
     sx = g["start_x"].astype("float32").values
     sy = g["start_y"].astype("float32").values
     ex = g["end_x"].astype("float32").values
@@ -211,28 +215,28 @@ def build_episode_from_df(g, le_type, le_res):
     last_start_x = float(sx[-1])
     last_start_y = float(sy[-1])
     
-    # mask last end for leak-safe
+    # leak-safe masking
     ex_mask = ex.copy()
     ey_mask = ey.copy()
     ex_mask[-1] = 0.0
     ey_mask[-1] = 0.0
     
-    # goal segment distance
+    # goal geometry features
     dxg = GOAL_X - sx
-    dy_goal = np.maximum(0.0, np.maximum(GOAL_Y_L - sy, sy - GOAL_Y_R)).astype("float32")
+    dy_goal = np.maximum(0.0, np.maximum(GOAL_Y_L - sy, sy - GOAL_Y_R))
     dist_to_goal = np.sqrt(dxg**2 + dy_goal**2).astype("float32")
     
-    # goal view angle
-    alpha_L = np.arctan2(GOAL_Y_L - sy, GOAL_X - sx).astype("float32")
-    alpha_R = np.arctan2(GOAL_Y_R - sy, GOAL_X - sx).astype("float32")
+    # angles to goal posts
+    alpha_L = np.arctan2(GOAL_Y_L - sy, dxg).astype("float32")
+    alpha_R = np.arctan2(GOAL_Y_R - sy, dxg).astype("float32")
     theta_view = np.abs(alpha_R - alpha_L).astype("float32")
     
-    # half line features
+    # half line
     in_own_half = (sx < HALF_X).astype("float32")
     
-    # penalty box features
-    dx_box = np.maximum(0.0, P_BOX_X_MIN - sx).astype("float32")
-    dy_box = np.maximum(0.0, np.maximum(P_BOX_Y_MIN - sy, sy - P_BOX_Y_MAX)).astype("float32")
+    # penalty box
+    dx_box = np.maximum(0.0, P_BOX_X_MIN - sx)
+    dy_box = np.maximum(0.0, np.maximum(P_BOX_Y_MIN - sy, sy - P_BOX_Y_MAX))
     dist_p_box = np.sqrt(dx_box**2 + dy_box**2).astype("float32")
     
     # previous event features
@@ -250,17 +254,14 @@ def build_episode_from_df(g, le_type, le_res):
     
     # continuous features
     cont = np.stack([
-        sx, sy, ex_mask, ey_mask, dt,
-        dist_to_goal, theta_view, in_own_half,
-        dist_p_box, prev_dx, prev_dy, prev_valid
-    ], axis=1).astype("float32")
+        sx,            sy,            ex_mask,            ey_mask,            dt,            dist_to_goal,            theta_view,            in_own_half,            dist_p_box,            prev_dx,            prev_dy,            prev_valid    ], axis=1).astype("float32")
     
     return cont, type_id, res_id, last_start_x, last_start_y
 
 
-# ============================================================
-# 3. Main Inference
-# ============================================================
+# -----------------------------------
+# Main Inference
+# -----------------------------------
 
 def main():
     # Paths
@@ -325,21 +326,12 @@ def main():
             predict_delta = config.pop("predict_delta")
         if "use_gaussian_nll" not in config:
             config["use_gaussian_nll"] = False
-        if "use_last_token" not in config:
-            config["use_last_token"] = False  # 이전 모델과 호환성 유지
-        
-        # Remove deprecated parameters for compatibility
-        if "use_skip_start" in config:
-            config.pop("use_skip_start")
         
         use_gaussian_nll = config.get("use_gaussian_nll", False)
-        use_last_token = config.get("use_last_token", False)
         
         print(f"  Config: d_model={config.get('d_model', 128)}, "
               f"n_layers={config.get('n_layers', 4)}, "
-              f"use_cls_token={config.get('use_cls_token', False)}, "
-              f"use_gaussian_nll={use_gaussian_nll}, "
-              f"use_last_token={use_last_token}")
+              f"use_gaussian_nll={use_gaussian_nll}")
         
         # Create and load model
         model = PassTransformer(**config).to(DEVICE)
@@ -385,7 +377,7 @@ def main():
                 
                 if use_gaussian_nll:
                     # Output is [mu_x, mu_y, log_var_x, log_var_y]
-                    # Take only mean (mu_x, mu_y)
+                    # Take only mean (mu_x, mu_y) to cal euclidean distance, var not used
                     pred_xy = pred_np[:2]
                 else:
                     pred_xy = pred_np[:2]
@@ -395,8 +387,10 @@ def main():
             # Average predictions
             avg_pred = np.mean(ensemble_preds, axis=0).astype("float32")
             
-            # Convert delta to absolute if needed
+            # end = start + delta
+            # pred_abs 절댓값이 아니라 절대적인 위치라는 뜻
             if predict_delta:
+                # Convert delta to absolute: end = start + delta
                 end_x = last_start_x + avg_pred[0]
                 end_y = last_start_y + avg_pred[1]
                 avg_pred = np.array([end_x, end_y], dtype="float32")

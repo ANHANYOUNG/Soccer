@@ -168,7 +168,7 @@ draw_fold_progress() {
 }
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Training Progress (150 epochs × 3 seeds per fold)"
+echo "Training Progress (150 epochs × seeds per fold)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # Continuous monitoring until all processes complete

@@ -104,9 +104,10 @@ python3 train.py --mode overfit --overfit_epochs 500
         NOISE_STD = 0.5
         K_TRUNCATE = 50     
 7) 원래대로 회귀, 학습 진행
-        D_MODEL: 128 -> Average: 13.8467
-        D_MODEL: 256 -> Average: 13.7814
+        D_MODEL: 128 -> Average: 13.8467 -> 리더보드 13.7650132564
+        D_MODEL: 256 -> Average: 13.7814 -> 리더보드 13.9131022669
 ```
+
 
 ## Debug 2025.12.30
 ```
